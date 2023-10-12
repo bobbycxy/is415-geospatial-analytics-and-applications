@@ -1,0 +1,1791 @@
+---
+title: "WorkingsFileSeattle_RShiny"
+author: "CHENG Xin Yuan"
+date: "31 March 2019"
+output: word_document
+---
+
+```{r}
+package <- c('rgeos','shinydashboard','RColorBrewer','leaflet','shinythemes','shiny','spatstat','raster','tmaptools','rgdal','sf','sp','tmap','tidyverse')
+
+for (p in package) {
+  if(!require(p, character.only = TRUE)) {
+    install.packages(p)
+  }
+  library(p, character.only = TRUE)
+}
+```
+
+***
+# Data Sources
+1. Downtown Airbnb Listings
+#Importing datasets
+
+##Zoning data
+```{r}
+#importing zoning data
+zones = st_read(dsn = "data/spatial", layer = "Zoning_Generalized")
+st_crs(zones) #uses CRS espg 4326 (WGS84)
+
+#transform to EPSG:32148 NAD83
+zones_32148 <- st_transform(zones, 32148)
+st_crs(zones_32148)
+
+#creating projection object and checking that it is correct
+crs_object <- st_crs(zones_32148) 
+class(crs_object)
+list(crs_object)
+```
+
+##Listings data
+```{r}
+#importing listings
+listing = read.csv("data/aspatial/listings.csv")
+
+#transforming listings as sf data
+#ALWAYS LONG THEN LAT
+listing_sf <- st_as_sf(listing, 
+                       coords = c("longitude", "latitude"), crs = 4326)
+listing_32148 <- st_transform(listing_sf, crs_object) #transform to same crs
+st_crs(listing_32148)
+st_bbox(listing_32148)
+```
+
+###Appending the Zone data to Listings
+Done by filtering those within "Downtown" Class description in zoning data
+``` {r}
+test_class_listing = st_join(listing_32148, zones_32148["CLASS_DESC"])
+```
+
+###Filtering to get only Downtown listings
+```{r}
+dt_listing <- subset(test_class_listing, test_class_listing$CLASS_DESC == "Downtown")
+```
+
+##Neighbourhood data
+```{r}
+seattle_neighbourhood = st_read(dsn = "data/spatial", layer = "City_Clerk_Neighborhoods")
+st_crs(seattle_neighbourhood) #uses CRS espg 4326 (WGS84)
+
+#transform to EPSG:32148 NAD83
+seattle_neighbourhood_32148 <- st_transform(seattle_neighbourhood, 32148)
+st_crs(seattle_neighbourhood_32148)
+
+#creating projection object and checking that it is correct
+crs_object <- st_crs(seattle_neighbourhood_32148) 
+class(crs_object)
+list(crs_object)
+
+st_bbox(seattle_neighbourhood_32148, crs = crs_object) #viewing extent of the boundaries
+```
+
+###Appending the S_HOOD neighbourhood to listings
+```{r}
+#append S_HOOD to listings
+test_nodes = st_join(dt_listing, seattle_neighbourhood_32148["S_HOOD"])
+```
+
+###Filtering to see if any aren't within neighbourhood boundaries
+```{r}
+dt_listing_hood <- subset(test_nodes, is.na(test_nodes$S_HOOD) == FALSE)
+#all are within neighbourhood boundaries
+```
+
+
+# Plot of listings in Downtown
+```{r}
+tmap_mode("view")
+
+tm_shape(dt_listing_hood) +
+  tm_bubbles(col = "red", size = 0.05) +
+  tm_basemap("OpenStreetMap")
+
+tmap_mode("plot")
+```
+
+
+#Data wrangling
+
+##Looking at how many empty values each column has
+```{r}
+sapply(dt_listing_hood, function(x) sum(is.na(x)))
+```
+
+
+##Keeping only the columns which are relevant to price
+```{r}
+#only keeping the relevant rows
+non_descriptive_col <- c('id', 'host_since', 'host_response_time', 'host_is_superhost', 'host_identity_verified', 'property_type', 'room_type', 'accommodates', 'bathrooms', 'bedrooms', 'bed_type', 'amenities', 'price', 'minimum_nights', 'maximum_nights', 'number_of_reviews', 'cancellation_policy', 'S_HOOD', 'review_scores_rating')
+listings <- select(dt_listing_hood, non_descriptive_col)
+```
+
+###Price
+First, we need to deal ensure the variable is numeric
+```{r}
+#removing $ and . from variables indicating price
+listings$price = as.numeric(gsub("[\\$,\\,]", "", listings$price))
+```
+
+###Host-since --> Host_experience
+Creating a variable to allow us to track how long the host has been on Airbnb
+```{r}
+#creating var for length of experience as host; using earliest date of scraping for this data self 2018-11-15
+listings$host_since <- as.Date(as.character(listings$host_since), format="%Y-%m-%d")
+listings$host_experience <- as.numeric(as.Date(as.character("2018-11-15"), format="%Y-%m-%d") - as.Date(as.character(listings$host_since), format="%Y-%m-%d"))
+```
+
+###Host_is_superhost & host_identity_verified
+```{r}
+#other binary vars
+listings$host_is_superhost <- ifelse(listings$host_is_superhost == "t", 1, 0)
+listings$host_identity_verified <- ifelse(listings$host_identity_verified == "t", 1, 0)
+```
+
+```{r}
+str(listings)
+```
+
+```{r}
+downtown_listings_trimmed_sp <- as(listings, "Spatial")
+```
+
+```{r}
+proj4string(downtown_listings_trimmed_sp)
+```
+
+
+```{r}
+tempfile <- downtown_listings_trimmed_sp
+```
+
+#Basic Amenities - above 50% (573)
+listings$BasicAmenities = ifelse(grepl("Kitchen", listings$amenities), 1, 0) + 
+  ifelse(grepl("Wifi", listings$amenities), 1, 0) +
+  ifelse(grepl("Essentials", listings$amenities), 1, 0) +
+  ifelse(grepl("TV", listings$amenities), 1, 0) +
+  ifelse(grepl("Heating", listings$amenities), 1, 0) +
+  ifelse(grepl("Hairdryer", listings$amenities), 1, 0) +
+  ifelse(grepl("Washer", listings$amenities), 1, 0) +
+  ifelse(grepl("Iron", listings$amenities), 1, 0) +
+  ifelse(grepl("Smokedetector", listings$amenities), 1, 0) +
+  ifelse(grepl("Dryer", listings$amenities), 1, 0) +
+  ifelse(grepl("Shampoo", listings$amenities), 1, 0) +
+  ifelse(grepl("Hangers", listings$amenities), 1, 0) +
+  ifelse(grepl("Elevator", listings$amenities), 1, 0) +
+  ifelse(grepl("Laptopfriendlyworkspace", listings$amenities), 1, 0) +
+  ifelse(grepl("Carbonmonoxidedetector", listings$amenities), 1, 0) +
+  ifelse(grepl("Gym", listings$amenities), 1, 0) +
+  ifelse(grepl("Family", listings$amenities), 1, 0) +
+  ifelse(grepl("kidfriendly", listings$amenities), 1, 0) +
+  ifelse(grepl("Internet", listings$amenities), 1, 0) +
+  ifelse(grepl("Fireextinguisher", listings$amenities), 1, 0)
+
+```{r}
+tempfile$Kitchen <- ifelse(grepl('Kitchen', tempfile$amenities), "1", "0")
+tempfile$Wifi <- ifelse(grepl('Wifi', tempfile$amenities), "1", "0")
+tempfile$Essentials <- ifelse(grepl('Essentials', tempfile$amenities), "1", "0")
+tempfile$TV <- ifelse(grepl('TV', tempfile$amenities), "1", "0")
+tempfile$Heating <- ifelse(grepl('Heating', tempfile$amenities), "1", "0")
+tempfile$Hairdryer <- ifelse(grepl('Hairdryer', tempfile$amenities), "1", "0")
+tempfile$Washer <- ifelse(grepl('Washer', tempfile$amenities), "1", "0")
+tempfile$Iron <- ifelse(grepl('Iron', tempfile$amenities), "1", "0")
+tempfile$Smokedetector <- ifelse(grepl('Smokedetector', tempfile$amenities), "1", "0")
+tempfile$Dryer <- ifelse(grepl('Dryer', tempfile$amenities), "1", "0")
+tempfile$Shampoo <- ifelse(grepl('Shampoo', tempfile$amenities), "1", "0")
+tempfile$Hangers <- ifelse(grepl('Hangers', tempfile$amenities), "1", "0")
+tempfile$Elevator <- ifelse(grepl('Elevator', tempfile$amenities), "1", "0")
+tempfile$Laptopfriendlyworkspace <- ifelse(grepl('Laptopfriendlyworkspace', tempfile$amenities), "1", "0")
+tempfile$Carbonmonoxidedetector <- ifelse(grepl('Carbonmonoxidedetector', tempfile$amenities), "1", "0")
+tempfile$Gym <- ifelse(grepl('Gym', tempfile$amenities), "1", "0")
+tempfile$Family <- ifelse(grepl('Family', tempfile$amenities), "1", "0")
+tempfile$kidfriendly <- ifelse(grepl('kidfriendly', tempfile$amenities), "1", "0")
+tempfile$Internet <- ifelse(grepl('Internet', tempfile$amenities), "1", "0")
+tempfile$Fireextinguisher <- ifelse(grepl('Fireextinguisher', tempfile$amenities), "1", "0")
+```
+
+#Leisure Friendly Amenities - between 50 and 25% have (above 287)
+listings$LeisureAmenities <- ifelse(grepl("Selfcheck", listings$amenities), 1, 0) +
+  ifelse(grepl("Airconditioning", listings$amenities), 1, 0) +
+  ifelse(grepl("Hotwater", listings$amenities), 1, 0) +
+  ifelse(grepl("Firstaidkit", listings$amenities), 1, 0) +
+  ifelse(grepl("Refrigerator", listings$amenities), 1, 0) +
+  ifelse(grepl("CoffeeMaker", listings$amenities), 1, 0) +
+  ifelse(grepl("Microwave", listings$amenities), 1, 0) +
+  ifelse(grepl("Oven", listings$amenities), 1, 0) +
+  ifelse(grepl("CableTV", listings$amenities), 1, 0) +
+  ifelse(grepl("Dishesandsilverware", listings$amenities), 1, 0) +
+  ifelse(grepl("Cookingbasics", listings$amenities), 1, 0) +
+  ifelse(grepl("Stove", listings$amenities), 1, 0) +
+  ifelse(grepl("Dishwasher", listings$amenities), 1, 0) +
+  ifelse(grepl("24", listings$amenities), 1, 0) +
+  ifelse(grepl("Pool", listings$amenities), 1, 0) +
+  ifelse(grepl("Safetycard", listings$amenities), 1, 0) +
+  ifelse(grepl("Bedlinens", listings$amenities), 1, 0)
+
+```{r}
+tempfile$Selfcheck <- ifelse(grepl('Selfcheck', tempfile$amenities), "1", "0")
+tempfile$Airconditioning <- ifelse(grepl('Airconditioning', tempfile$amenities), "1", "0")
+tempfile$Hotwater <- ifelse(grepl('Hotwater', tempfile$amenities), "1", "0")
+tempfile$Firstaidkit <- ifelse(grepl('Firstaidkit', tempfile$amenities), "1", "0")
+tempfile$Refrigerator <- ifelse(grepl('Refrigerator', tempfile$amenities), "1", "0")
+tempfile$CoffeeMaker <- ifelse(grepl('CoffeeMaker', tempfile$amenities), "1", "0")
+tempfile$Microwave <- ifelse(grepl('Microwave', tempfile$amenities), "1", "0")
+tempfile$Oven <- ifelse(grepl('Oven', tempfile$amenities), "1", "0")
+tempfile$CableTV <- ifelse(grepl('CableTV', tempfile$amenities), "1", "0")
+tempfile$Dishesandsilverware <- ifelse(grepl('Dishesandsilverware', tempfile$amenities), "1", "0")
+tempfile$Cookingbasics <- ifelse(grepl('Cookingbasics', tempfile$amenities), "1", "0")
+tempfile$Stove <- ifelse(grepl('Stove', tempfile$amenities), "1", "0")
+tempfile$Dishwasher <- ifelse(grepl('Dishwasher', tempfile$amenities), "1", "0")
+tempfile$TwentyFour <- ifelse(grepl('24', tempfile$amenities), "1", "0")
+tempfile$Pool <- ifelse(grepl('Pool', tempfile$amenities), "1", "0")
+tempfile$Safetycard <- ifelse(grepl('Safetycard', tempfile$amenities), "1", "0")
+tempfile$Bedlinens <- ifelse(grepl('Bedlinens', tempfile$amenities), "1", "0")
+```
+
+#Luxury Amenities - between 25 and 10% have (147)
+listings$LuxuryAmenities <- ifelse(grepl("freeaccess", listings$amenities), 1, 0) +
+  ifelse(grepl("Longtermstayallowed", listings$amenities), 1, 0) +
+  ifelse(grepl("Keypad", listings$amenities), 1, 0) +
+  ifelse(grepl("Hottub", listings$amenities), 1, 0) +
+  ifelse(grepl("Lockbox", listings$amenities), 1, 0) +
+  ifelse(grepl("Hostgreetsyou", listings$amenities), 1, 0) +
+  ifelse(grepl("Smartlock", listings$amenities), 1, 0) +
+  ifelse(grepl("Petsallowed", listings$amenities), 1, 0) +
+  ifelse(grepl("BBQgrill", listings$amenities), 1, 0) +
+  ifelse(grepl("Paidparkingoffpremises", listings$amenities), 1, 0) +
+  ifelse(grepl("Freeparkingoffpremises", listings$amenities), 1, 0) +
+  ifelse(grepl("Patioorbalcony", listings$amenities), 1, 0)  +
+  ifelse(grepl("Paidparkingonpremises", listings$amenities), 1, 0) +
+  ifelse(grepl("Buildingstaff", listings$amenities), 1, 0) +
+  ifelse(grepl("Luggagedropoffallowed", listings$amenities), 1, 0)  +
+  ifelse(grepl("Indoorfireplace", listings$amenities), 1, 0)
+
+```{r}
+tempfile$freeaccess <- ifelse(grepl('freeaccess', tempfile$amenities), "1", "0")
+tempfile$Longtermstayallowed <- ifelse(grepl('Longtermstayallowed', tempfile$amenities), "1", "0")
+tempfile$Keypad <- ifelse(grepl('Keypad', tempfile$amenities), "1", "0")
+tempfile$Hottub <- ifelse(grepl('Hottub', tempfile$amenities), "1", "0")
+tempfile$Lockbox <- ifelse(grepl('Lockbox', tempfile$amenities), "1", "0")
+tempfile$Hostgreetsyou <- ifelse(grepl('Hostgreetsyou', tempfile$amenities), "1", "0")
+tempfile$Smartlock <- ifelse(grepl('Smartlock', tempfile$amenities), "1", "0")
+tempfile$Petsallowed <- ifelse(grepl('Petsallowed', tempfile$amenities), "1", "0")
+tempfile$BBQgrill <- ifelse(grepl('BBQgrill', tempfile$amenities), "1", "0")
+tempfile$Paidparkingoffpremises <- ifelse(grepl('Paidparkingoffpremises', tempfile$amenities), "1", "0")
+tempfile$Freeparkingoffpremises <- ifelse(grepl('Freeparkingoffpremises', tempfile$amenities), "1", "0")
+tempfile$Patioorbalcony <- ifelse(grepl('Patioorbalcony', tempfile$amenities), "1", "0")
+tempfile$Paidparkingonpremises <- ifelse(grepl('Paidparkingonpremises', tempfile$amenities), "1", "0")
+tempfile$Buildingstaff <- ifelse(grepl('Buildingstaff', tempfile$amenities), "1", "0")
+tempfile$Luggagedropoffallowed <- ifelse(grepl('Luggagedropoffallowed', tempfile$amenities), "1", "0")
+tempfile$Indoorfireplace <- ifelse(grepl('Indoorfireplace', tempfile$amenities), "1", "0")
+
+```
+
+
+```{r}
+tempfile@data
+```
+
+```{r}
+table(tempfile$Wifi)
+```
+
+```{r}
+tempfile <- spTransform(tempfile, CRS("+init=epsg:32148"))
+proj4string(tempfile)
+```
+# Proj4string is the same. Hence, can create this to test i out
+
+```{r}
+tempfile@data <- select(tempfile@data, 1:11, 13:73)
+```
+
+```{r}
+tempfile@data
+```
+
+```{r}
+tempfile$property_type <- as.character(tempfile$property_type)
+```
+
+
+```{r}
+downtown_listings_sp <- tempfile
+```
+
+
+2. Seattle Downtown Shapefile
+
+```{r}
+seattle_sp <- readOGR(dsn = 'data/spatial',
+                   layer = 'City_Clerk_Neighborhoods')
+```
+
+```{r}
+seattle_downtown_sp <- subset(seattle_sp, L_HOOD == 'DOWNTOWN')
+```
+
+```{r}
+downtown_listings_sp <- spTransform(downtown_listings_sp, CRS("+init=epsg:32148"))
+seattle_downtown_sp <- spTransform(seattle_downtown_sp, CRS("+init=epsg:32148"))
+proj4string(downtown_listings_sp)
+proj4string(seattle_downtown_sp)
+
+```
+
+3. Cluster Distances for each S_HOOD
+
+```{r}
+minimum_buffer_matrix <- as.data.frame(seattle_downtown_sp$S_HOOD)
+minimum_buffer_matrix$Min_Buffer_Radius <- as.numeric(c(4,2,20,5.5,0,0,10))
+names(minimum_buffer_matrix) <- c("S_HOOD", "Min_Buffer_Radius")
+minimum_buffer_matrix
+```
+
+4. 
+
+## Get the attraction
+
+```{r}
+cpn <- readOGR(dsn = 'data/spatial',
+               layer = 'Common_Place_Names_CPN')
+```
+
+```{r}
+filter(cpn@data, CPN_PLACEN == "WASHINGTON STATE CONVENTION CENTER")
+```
+
+### Check if the locations given by Chloe are in the CPN data
+```{r}
+attraction_loc <- c("PIKE PLACE MARKET","BENAROYA CONCERT HALL","COLUMBIA CENTER","SEATTLE ART MUSEUM","OLYMPIC SCULPTURE PARK","SEATTLE PUBLIC LIBRARY (DOWNTOWN)","SEATTLE GREAT WHEEL","WASHINGTON STATE FERRIES","THE SEATTLE AQUARIUM","KLONDIKE GOLDRUSH","SPACE NEEDLE")
+```
+*Verdict: yes, it is inside*
+
+
+```{r}
+attractions <- subset(cpn,CPN_PLACEN %in% attraction_loc)
+```
+
+```{r}
+attraction_names <- attractions$CPN_PLACEN
+```
+
+```{r}
+attraction_names <- attraction_names[attraction_names %in% c("OLYMPIC SCULPTURE PARK","KLONDIKE GOLDRUSH","WASHINGTON STATE FERRIES")]
+```
+
+```{r}
+attraction_names <- as.character(attraction_names)
+```
+
+#Replacement of location names Benaroya Concert Hall to BENAROYA HALL and Seattle Public Library to CENTRAL LIBRARY
+```{r}
+attraction_names <- ifelse(attraction_names == "OLYMPIC SCULPTURE PARK","OLYMPIC SCULPTURE PARK SEATTLE",ifelse(attraction_names == "KLONDIKE GOLDRUSH","KLONDIKE GOLD RUSH NATIONAL HISTORICAL PARK SEATTLE","WASHINGTON STATE CONVENTION CENTER"))
+```
+
+```{r}
+attraction_names_geocode <- geocode_OSM(attraction_names)
+coordinates(attraction_names_geocode) <- ~lon+lat
+```
+
+```{r}
+filter_for_correct <- c("PIKE PLACE MARKET","BENAROYA CONCERT HALL","COLUMBIA CENTER","SEATTLE ART MUSEUM","SEATTLE PUBLIC LIBRARY (DOWNTOWN)","SEATTLE GREAT WHEEL","WASHINGTON STATE FERRIES","THE SEATTLE AQUARIUM","SPACE NEEDLE")
+```
+
+```{r}
+attractions <- subset(attractions, CPN_PLACEN %in% filter_for_correct)
+
+coordinatesA <- coordinates(attractions)
+
+namesA <- attractions$CPN_PLACEN
+```
+
+```{r}
+coordinatesB <- coordinates(attraction_names_geocode)
+
+namesB <- attraction_names_geocode$query
+```
+
+```{r}
+namesA <- as.character(namesA)
+```
+
+
+```{r}
+namesA <- as.data.frame(namesA)
+names(namesA) <- "Name"
+namesB <- as.data.frame(namesB)
+names(namesB) <- "Name"
+
+```
+
+```{r}
+NewAttractions <-  rbind(namesA,namesB)
+```
+
+```{r}
+NewCoordinates <- rbind(coordinatesA, coordinatesB)
+NewCoordinates <- as.data.frame(NewCoordinates)
+```
+
+```{r}
+downtown_attractions <- SpatialPointsDataFrame(coords = NewCoordinates,
+                                       data = NewAttractions,
+                                       proj4string = CRS("+init=epsg:4326"))
+```
+
+```{r}
+downtown_attractions <- spTransform(downtown_attractions, CRS("+init=EPSG:32148"))
+```
+
+5. Zoning (Generalised)
+```{r}
+zoning_generalized <- readOGR(dsn = "data/spatial",
+                              layer = "Zoning_Generalized")
+```
+
+
+DATASOURCE Names
+i) downtown_listings_sp
+ii) seattle_downtown_sp
+iii) minimum_buffer_matrix
+iv) downtown_attractions
+
+
+***
+
+
+
+
+# Sample of working steps
+```{r}
+location <- "washington state ferries"
+class(location)
+```
+
+```{r}
+temp <- geocode_OSM(location, as.data.frame = TRUE)
+class(temp)
+coordinates(temp) <- ~lon+lat
+```
+
+```{r}
+coordinates(temp)
+```
+
+```{r}
+chosen_location <- SpatialPointsDataFrame(coordinates(temp),
+                                          temp@data,
+                                          proj4string = CRS('+init=EPSG:4326'))
+```
+
+```{r}
+chosen_location <- spTransform(chosen_location,CRS("+init=epsg:32148"))
+
+```
+
+
+```{r}
+tmap_mode("view")
+tm_shape(chosen_location) +
+  tm_markers()
+```
+
+```{r}
+tm_shape(seattle_downtown_sp) +
+  tm_polygons()
+```
+
+```{r}
+seattle_downtown_sp@data
+```
+
+
+```{r}
+temp <- over(chosen_location,seattle_downtown_sp)
+temp <- table(temp$S_HOOD)
+temp
+```
+
+```{r}
+temp <- as.data.frame(temp)
+```
+
+```{r}
+temp1 <- as.data.frame(seattle_downtown_sp$S_HOOD)
+names(temp1) <- "Var1"
+temp1
+```
+
+
+```{r}
+temptable <- inner_join(temp1, temp,
+                        by = c('Var1' = 'Var1'))
+```
+
+```{r}
+temptable
+```
+
+```{r}
+yoyo <- filter(temptable,Freq == 1)[1]
+```
+
+```{r}
+temptable[2, 1]
+```
+
+```{r}
+yoyo
+```
+
+```{r}
+filter(temptable, Freq == 1)[1,1]
+```
+
+
+```{r}
+temptable <- inner_join(temptable,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+temptable
+```
+
+```{r}
+abc <- sum(temptable$Freq*temptable$Min_Buffer_Radius)
+abc
+```
+
+```{r}
+table(downtown_listings_sp$room_type)
+```
+
+
+### Bringing in of Chloe's LM Listing data set to inspect first, before knowing how to perform merge
+```{r}
+chloeListing <- read_csv("data/aspatial/listingsLM_df.csv")
+```
+
+```{r}
+chloeListing
+```
+
+```{r}
+table(chloeListing$host_response_time)
+```
+
+```{r}
+chloeListing$accommodates
+```
+
+
+```{r}
+table(downtown_listings_sp$Airconditioning)
+```
+
+
+
+
+
+
+*** 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+***
+With shinydashboard
+```{r}
+ui <- dashboardPage(
+  skin = "black",
+  
+  header <- dashboardHeader(title = "Too High, Too Low, or Just Right?",
+                           titleWidth = 400),
+  
+  sidebar <- dashboardSidebar(
+    sidebarMenu(
+      menuItem("Overview",
+               tabName = "overview",
+               menuSubItem("Background",
+                           tabName = "background"),
+               menuSubItem("Sandbox (Data Sources)",
+                           tabName = "sandbox")),
+      menuItem("Point Pattern Analysis",
+               tabName = "PPA"),
+      menuItem("Geographically Weighted Regression",
+               tabName = "GWR")
+    ),
+    width = 300
+  ),
+  
+  body <- dashboardBody(
+    
+    # CSS Code Chunk to change the font of our dashboard header title
+    tags$head(tags$style(HTML('
+      
+      .main-header .logo {
+        font-family: "Georgia", Times, "Lobster", cursive;
+        font-weight: bold;
+        font-size: 18px;
+      }
+    '))),
+    
+    tabItems(
+      tabItem(tabName = "background",
+        fluidRow(
+          column(6,
+              
+            # Text for Introduction
+              wellPanel(style = "background: #D5D2D0",     
+              h2("Hi there."),
+              h4(
+                
+tags$b("Here’s 2 questions. How can an Airbnb host have a more perfect knowledge of the market around her/his listing(s), regardless if it’s existing or new? And what should be a good price of leasing one for a night?"), br(),br(),
+                 
+"A majority of Airbnb hosts are individuals who list apartment(s) as side business, but they generally lack the knowledge to build optimal pricing models for themselves. And while Airbnb has made its data publicly available, there is still a general lack of analytical platforms to guide hosts in answering the above questions.", br(),br(),
+
+"Our team feels that any hosts can benefit from the distillation of these big data into valuable insights. Democratizing such data through web based applications such as ours could trigger better decision making for hosts all around, which in turn makes the market more competitive; spilling over its benefits to consumers like you and us.", br(), br(),
+
+"Hence, our model aims to stand in this gap with the following services:", br(), br(),
+
+"1.	A picturesque and interactive map application, powered by Leaflet, that invites users to derive new insights on the neighbourhood(s) they’ve chosen, and;", br(), br(),
+  
+
+"2.	A Geographically Weighted Regression (GWR) that helps hosts more confidently price their listings at optimal rates, rather than arbitrarily. 
+  ")
+          #closing parenthesis for "wellPanel"
+          ),
+        
+        wellPanel(
+           h3("Data Sources used:"),
+           p("1. Airbnb Listings",style = "font-size:14pt"),
+           paste("A .csv file originally containing information on all Airbnb listings found within Seattle, last scrapped on 15 November 2018. With this file, we filtered for listings based only in Downtown Seattle"),br(),br(),
+           
+           p("2. Common Place Names",style = "font-size:14pt"),
+           paste("A shapefile featuring common place names and corresponding locations in Seattle."),br(),br(),
+           
+           p("3. City Clerk Neighbourhood",style = "font-size:14pt"),
+           paste("A shapefile featuring 20 Large City Clerk neighborhood boundaries, along with their smaller neighborhood boundaries."),br(),br(),
+           
+           p("4. Zoning (Generalised)",style = "font-size:14pt"),
+           paste("A shapefile featuring boudaries which are not labelled by neighbourhood names, but rather, urban planning descriptions. i.e. Downtown, Major Institutions, Manufacturing/Industrial, Multifamily, Neighbourhood/Commercial, Residential/Commercial and Single Family")),br(),br()
+                     
+            
+      ),
+
+        column(6,
+               wellPanel(
+               leafletOutput(outputId = "intro_map",height = 950))
+               )
+      )),
+
+      tabItem(tabName = "sandbox",
+               tabBox(width = 12,
+                      tabPanel("Seattle Listings",
+                               h4("Source: insideairbnb.com"),br(),
+                               dataTableOutput(outputId = "seattleListings")),
+                      tabPanel("Common Plance Name",
+                               h4("Source: data-seattlecitygis.opendata.arcgis.com"),br(), 
+                               dataTableOutput(outputId =  "commonPlaceName")),
+                      tabPanel("City Clerk Neighbourhood", 
+                               h4("Source: seattle.gov"),br(),
+                               dataTableOutput(outputId = "cityClerkNeighbourhood")),
+                      tabPanel("Zoning Generalized", 
+                               h4("Source: data-seattlecitygis.opendata.arcgis.com"),br(),
+                               dataTableOutput(outputId = "zoningGeneralized"))
+               )
+          ),
+
+      tabItem(tabName = "PPA",
+        fluidRow(
+          column(3,
+          
+          wellPanel(
+            h3("Description"),
+            paste0("We believe that the best decisions we make are the ones most well-informed. And our team wants to help you get there."), br(), br(), 
+            paste0("This tab will show you your neighbours' prices and characteristics, as well as a statistically derived value of when clusters of listings would form. With this information, we believe you are empowered to differentiate yourself from competitors, or be as similar to them."), br(), br(),
+            paste0("Go on, be empowered.")
+          ),       
+                 
+          wellPanel(
+            
+          h3("Where to investigate?"),
+          paste0("You may enter an existing listing address, or a new listing address you're considering."), 
+          br(),br(),
+          
+          # Get customer's desired location
+          textInput(inputId = "entered_address",
+                    label = "Enter the address"),
+          
+          # Action button to only update visual renders after clicking this
+          actionButton(inputId = "run", label = "Run")
+          ),
+          
+          wellPanel(
+          h3("Filters"),
+          paste0("Go on, try it. And discover some new things about your location."),
+          br(),br(),
+          
+          # Select slider for buffer range
+          sliderInput(inputId = 'buffer_radius',
+                      label = "Choose your buffer:",
+                      min = 0, max = 400,
+                      step = 20,
+                      value = 0),
+          
+          
+          # Select input for coloring of Leaflet
+          selectInput(inputId = 'colored_by',
+                      label = "Colored_by",
+                      choices = c("Property Type" = "property_type",
+                                  "Room Type" = "room_type",'Kitchen','Wifi','Essentials','TV','Heating','Hairdryer','Washer','Iron','Smoke Detector' = 'Smokedetector','Dryer','Shampoo','Hangers','Elevator','Laptop Friendly Workspace' = 'Laptopfriendlyworkspace','Carbon Monoxide Detector'='Carbonmonoxidedetector','Gym','Family','Kid Friendly' = 'kidfriendly','Internet','Fire Extinguisher' = 'Fireextinguisher','Self Check' = 'Selfcheck','Air Conditioning' = 'Airconditioning','Hot Water'='Hotwater','First Aid Kit' = 'Firstaidkit','Refrigerator','Coffee Maker' = 'CoffeeMaker','Microwave','Oven','Cable TV' = 'CableTV','Dishes and Silverware' = 'Dishesandseilverware','Cooking Basics'='Cookingbasics','Stove','Dishwasher',"24-hr" = 'TwentyFour','Pool',"Safety Card" = 'Safetycard','Bedlinens','Free Access' = 'freeaccess','Long Term Stay Allowed'='Longtermstayallowed','Keypad','Hottub','Lockbox','Host greets you'='Hostgreetsyou','Smartlock','Pets Allowed'='Petsallowed','BBQ Grill'='BBQgrill','Paid Parking Off-Premises'='Paidparkingoffpremises','Free Parking Off-Premises'='Freeparkingoffpremises','Patio or Balcony' = 'Patioorbalcony','Paid Parking On-Premises'='Paidparkingonpremises','Building Staff'='Buildingstaff','Luggage Drop Off Allowed' ='Luggagedroppoffallowed','Indoor Fireplace'='Indoorfireplace'),
+                      selected = "room_type")
+          )
+     
+        ),
+        
+        column(4,
+               
+               wellPanel(
+               h3("2nd Order Point Pattern Analysis"),
+               textOutput(outputId = "l_function_expln"),
+               br(),
+               fluidRow(
+                 column(8,
+                        imageOutput(outputId = "LFunction")),
+                 column(4,
+                        paste("The graph on the left is the statistical results of a 2nd Order Point Pattern Analysis performed in this neighbourhood."),br(),br(),
+                        paste("Where the black line crosses above the grey horizontal bandwidth indicates the minimum distance at which clusters of airbnb listings would begin to form."))
+                 )
+               ),
+               
+               wellPanel(
+               h3("Buffer Analysis"),
+                  fluidRow(
+                    column(6,
+                     textOutput(outputId = "min_buffer")),
+                    column(6,
+                     textOutput(outputId = "number_of_neighbours"))),
+                  fluidRow(
+                    column(6,
+                           plotOutput(outputId = "price_histogram",height="350px"),
+                           paste0("The histogram above describes the distribution of listing prices within your chosen buffer.")),
+                    column(6,
+                           plotOutput(outputId = "choice_of_barChart", height ="350px"),
+                           paste0("The bar chart above reflects the proportion of a variable that your chosen buffer has.")))
+               )
+            ),
+        column(5,
+               
+               wellPanel(
+               h3("Leaflet Map"),
+               leafletOutput(outputId = "buffer_map",height = 950))
+        )
+               )
+            )
+        )
+     )
+  )
+
+
+server <- function(input, output) {
+  
+  queried_location <- eventReactive(input$run,{
+      req(input$entered_address)
+      paste(input$entered_address, "Seattle")
+    })
+  
+    output$intro_map <- renderLeaflet({
+      ## Creation of RColorBrewer Color Palette
+        color_palette <- brewer.pal(12, "Set3")
+        
+        working_map <- tm_shape(seattle_downtown_sp) + tm_borders(lwd = 3) + tm_fill(col = "#F6EAD3", alpha = 0.5) + tm_view(set.zoom.limits = c(14,18)) + tm_basemap("Esri.WorldTopoMap") + tm_shape(downtown_listings_sp, popup.vars = c("Room Type" = "room_type", "Property Type" = "property_type")) + tm_dots(palette = color_palette) + tm_shape(downtown_attractions) + tm_markers()
+        
+        tmap_leaflet(working_map)
+      }
+    )
+  
+    output$l_function_expln <- renderText({
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Get the name of the Neighborhood within Downtown
+        ## To get the right name, we gotta lookup the name via the "over" function
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        neighborhood <- as.character(filter(temp_table, Freq == 1)[1,1])
+        paste0("You chosen location lies in the neighbourhood of ",neighborhood)
+    })
+  
+    output$LFunction <- renderImage({
+      
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Get the name of the Neighborhood within Downtown
+        ## To get the right name, we gotta lookup the name via the "over" function
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        neighborhood <- as.character(filter(temp_table, Freq == 1)[1,1])
+      
+      filename <- normalizePath(file.path('second_order_graphs',paste0(neighborhood, ".jpg")))
+      list(src = filename,
+           width = 325,
+           height = 390)
+      }, deleteFile = FALSE
+    )
+    
+    output$seattleListings <- renderDataTable(
+      downtown_listings_sp@data,
+      options = list(scrollX = TRUE,
+                     lengthMenu =c(5, 10, 15),
+        pageLength = 10)
+    )
+
+    output$commonPlaceName <- renderDataTable(
+      cpn@data,
+      options = list(scrollX = TRUE,
+                     lengthMenu =c(5, 10, 15, 25),
+        pageLength = 15)
+    )
+    
+    output$cityClerkNeighbourhood <- renderDataTable(
+      seattle_sp@data,
+      options = list(scrollX = TRUE,
+                     lengthMenu =c(5, 10, 15, 25),
+        pageLength = 15)
+    )
+    
+    output$zoningGeneralized <- renderDataTable(
+      zoning_generalized@data,
+      options = list(scrollX = TRUE,
+                     lengthMenu =c(5, 10, 15, 25),
+        pageLength = 10)
+    )
+    
+    output$min_buffer <- renderText({ 
+        req(input$entered_address)
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        # Paste the Text
+        paste("Minimum buffer radius: ", min_buffer_width, 'm')
+      })
+    
+    
+    output$buffer_map <- renderLeaflet({ req(input$entered_address)
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+        
+        ## Creation of RColorBrewer Color Palette
+        color_palette <- brewer.pal(12, "Set3")
+        
+        working_map <- tm_shape(seattle_downtown_sp) + tm_borders(lwd = 3) + tm_fill(col = "#F6EAD3", alpha = 0.5) + tm_shape(entered_location_buffer, is.master = TRUE) + tm_polygons(col = "#FFA150",alpha = 0.3) + tm_shape(entered_address_sp, is.master = FALSE) + tm_markers() + tm_view(set.zoom.limits = c(15,18)) + tm_basemap("Esri.WorldTopoMap") + tm_shape(downtown_listings_sp, popup.vars = c("Room Type" = "room_type", "Property Type" = "property_type")) + tm_dots(col = input$colored_by, palette = color_palette)
+        tmap_leaflet(working_map)
+      }
+    )
+    
+    output$number_of_neighbours <- renderText({
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      r <- nrow(as.data.frame(ra))
+      paste0("Number of neighbouring listings within buffer: ", r)
+    })
+    
+    output$price_histogram <- renderPlot({
+       # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      ra_df <- as.data.frame(ra)
+      listings_in_buffer_df <- downtown_listings_sp@data[ra_df$col.id,]
+      
+      ggplot(data = listings_in_buffer_df, aes(x = price)) +
+        geom_histogram(binwidth = 20, color = "#1F3552", fill = "#4271AE") +
+        geom_vline(xintercept = mean(listings_in_buffer_df$price),size = 1, colour = "#FF3721",
+                   linetype = "dashed") +
+        stat_bin(aes(y=..count.., label=..count..), binwidth = 20,  geom="text", vjust=-.5) + labs(x="Price",y="Count")
+      
+    })
+    
+    output$choice_of_barChart <- renderPlot({
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      ra_df <- as.data.frame(ra)
+      listings_in_buffer_df <- downtown_listings_sp@data[ra_df$col.id,]
+      
+      temptemp <- listings_in_buffer_df %>% group_by_(input$colored_by) %>% summarise("total" = n())
+      
+      ggplot(data = temptemp, aes_string(x = input$colored_by, y = temptemp$total, fill = input$colored_by)) + 
+        geom_col(width = 1, stat = "count") + geom_text(aes_string(label = temptemp$total), vjust = -0.5) + scale_fill_brewer(palette="Set3") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.y = element_blank())
+    })
+  
+}
+
+shinyApp(ui, server)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r R-Shiny Code Chunk}
+# Define UI for application that plots features of movies 
+ui <- fluidPage(
+    theme = shinytheme("paper"),
+  
+    tabsetPanel(
+        tabPanel("Point Pattern Analysis",
+  # Fluidrow
+    fluidRow(
+      column(3,
+      
+      wellPanel(
+        h4("Description"),
+        paste0("We believe that the best decisions we make are the ones most well-informed. And our team wants to help you get there. This tab will show you your neighbours' prices and characteristics, as well as a statistically derived value of when clusters of listings would form. With this information, we believe you are empowered to differentiate yourself from competitors, or be as similar to them. Go on, be empowered.")
+      ),       
+             
+      wellPanel(
+        
+      h4("Where to investigate?"),
+      paste0("You may enter an existing listing address, or a new listing address you're considering."), 
+      br(),br(),
+      
+      # Get customer's desired location
+      textInput(inputId = "entered_address",
+                label = "Enter the address"),
+      
+      # Action button to only update visual renders after clicking this
+      actionButton(inputId = "run", label = "Run")
+      ),
+      
+      wellPanel(
+      h4("Filters"),
+      paste0("Go on, try it. And discover some new things about your location."),
+      br(),br(),
+      
+      # Select slider for buffer range
+      sliderInput(inputId = 'buffer_radius',
+                  label = "Choose your buffer:",
+                  min = 0, max = 400,
+                  step = 20,
+                  value = 0),
+      
+      # Select slider for Airbnb Listing opacity
+      sliderInput(inputId = 'alpha',
+                  label = "Opacity of Airbnb Listings:",
+                  min = 0, max = 1,
+                  step = 0.1,
+                  value = 0.5),
+      
+      # Select input for coloring of Leaflet
+      selectInput(inputId = 'colored_by',
+                  label = "Colored_by",
+                  choices = c("Property Type" = "property_type",
+                              "Room Type" = "room_type"),
+                  selected = "room_type")
+      )
+ 
+    ),
+    
+    column(4,
+           
+           wellPanel(
+           h4("2nd Order Point Pattern Analysis"),
+           textOutput(outputId = "l_function_expln"),
+           br(),
+           imageOutput(outputId = "LFunction",height = "425px"),
+           br(),br()
+           ),
+           
+           wellPanel(
+           h4("Buffer Analysis"),
+              fluidRow(
+                column(6,
+                 textOutput(outputId = "min_buffer")),
+                column(6,
+                 textOutput(outputId = "number_of_neighbours"))
+                 ),
+              fluidRow(
+                column(6,
+                       plotOutput(outputId = "price_histogram",height=275),
+                       paste0("The histogram above describes the distribution of listing prices within your chosen buffer.")),
+                column(6,
+                       plotOutput(outputId = "choice_of_barChart", height = 275),
+                       paste0("The bar chart above reflects the proportion of a variable that your chosen buffer has."))
+              )
+           )
+        ),
+    column(5,
+           
+           wellPanel(
+           h4("Leaflet Map"),
+           leafletOutput(outputId = "buffer_map",height = 950))
+           )
+      )
+    )
+  )
+)
+
+# Define server function required to create the scatterplot
+server <- function(input, output) {
+    
+    queried_location <- eventReactive(input$run,{
+      req(input$entered_address)
+      paste(input$entered_address, "Seattle")
+    })
+  
+    output$l_function_expln <- renderText({
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Get the name of the Neighborhood within Downtown
+        ## To get the right name, we gotta lookup the name via the "over" function
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        neighborhood <- as.character(filter(temp_table, Freq == 1)[1,1])
+        paste0("You chosen location lies in the neighbourhood of ",neighborhood)
+    })
+  
+    output$LFunction <- renderImage({
+      
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Get the name of the Neighborhood within Downtown
+        ## To get the right name, we gotta lookup the name via the "over" function
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        neighborhood <- as.character(filter(temp_table, Freq == 1)[1,1])
+      
+      filename <- normalizePath(file.path('second_order_graphs',paste0(neighborhood, ".jpg")))
+      list(src = filename)
+      }, deleteFile = FALSE
+    )
+
+    output$min_buffer <- renderText({ 
+        req(input$entered_address)
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        # Paste the Text
+        paste("Minimum buffer radius: ", min_buffer_width, 'm')
+      })
+    
+    
+    output$buffer_map <- renderLeaflet({ req(input$entered_address)
+        # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+        
+        ## Creation of RColorBrewer Color Palette
+        color_palette <- brewer.pal(12, "Set3")
+        
+        working_map <- tm_shape(entered_location_buffer, is.master = TRUE) + tm_polygons(col = 'yellow',alpha = 0.3) + tm_shape(entered_address_sp, is.master = FALSE) + tm_markers() + tm_view(set.zoom.limits = c(15,18)) + tm_basemap("Esri.WorldTopoMap") + tm_shape(downtown_listings_sp, popup.vars = c("Room Type" = "room_type", "Property Type" = "property_type")) + tm_dots(alpha = input$alpha, col = input$colored_by, palette = color_palette) + tm_shape(seattle_downtown_sp) + tm_borders(lwd = 3)
+        tmap_leaflet(working_map)
+      }
+    )
+    
+    output$number_of_neighbours <- renderText({
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      r <- nrow(as.data.frame(ra))
+      paste0("Number of neighbouring listings within buffer: ", r)
+    })
+    
+    output$price_histogram <- renderPlot({
+       # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      ra_df <- as.data.frame(ra)
+      listings_in_buffer_df <- downtown_listings_sp@data[ra_df$col.id,]
+      
+      ggplot(data = listings_in_buffer_df, aes(x = newprice)) +
+        geom_histogram(binwidth = 20, color = "#1F3552", fill = "#4271AE") +
+        geom_vline(xintercept = mean(listings_in_buffer_df$newprice),size = 1, colour = "#FF3721",
+                   linetype = "dashed") +
+        stat_bin(aes(y=..count.., label=..count..), binwidth = 20,  geom="text", vjust=-.5) + labs(x="Price",y="Count")
+      
+    })
+    
+    output$choice_of_barChart <- renderPlot({
+      # Fetching of Spatial Location of entered Address
+        location <- queried_location()
+        temp_df <- geocode_OSM(location, as.data.frame = TRUE)
+        coordinates(temp_df) <- ~lon+lat
+        entered_address_sp <- SpatialPointsDataFrame(coordinates(temp_df),
+                                                     as.data.frame(temp_df$query),
+                                                     proj4string = CRS('+init=EPSG:4326'))
+        entered_address_sp <- spTransform(entered_address_sp,CRS("+init=epsg:32148"))
+        names(entered_address_sp@data)[1] <- "Name: "
+        
+        # Set the Buffer of the entered location that's dependent on the S_Hood of the point
+        ## To get the right buffer, we gotta get the right S_HOOD
+        temp_over <- over(entered_address_sp, seattle_downtown_sp)
+        temp_over <- as.data.frame(table(temp_over$S_HOOD))
+        
+        temp_body <- as.data.frame(seattle_downtown_sp$S_HOOD)
+        names(temp_body) <- "Var1"
+        temp_body
+        
+        temp_table <- inner_join(temp_body, temp_over,
+                        by = c('Var1' = 'Var1'))
+        
+        temp_table <- inner_join(temp_table,minimum_buffer_matrix,
+                        by = c("Var1" = "S_HOOD"))
+        
+        min_buffer_width <- sum(temp_table$Freq*temp_table$Min_Buffer_Radius)
+        
+        ## Creation of Buffer around Entered Location
+        entered_location_buffer <- buffer(entered_address_sp, width = max(min_buffer_width, input$buffer_radius))
+      
+      buffer_sf <- st_as_sf(entered_location_buffer)
+      listing_sf <- st_as_sf(downtown_listings_sp)
+      ra <- st_contains(buffer_sf,listing_sf)
+      ra_df <- as.data.frame(ra)
+      listings_in_buffer_df <- downtown_listings_sp@data[ra_df$col.id,]
+      
+      temptemp <- listings_in_buffer_df %>% group_by_(input$colored_by) %>% summarise("total" = n())
+      
+      ggplot(data = temptemp, aes_string(x = input$colored_by, y = temptemp$total, fill = input$colored_by)) + 
+        geom_col(width = 1, stat = "count") + geom_text(aes_string(label = temptemp$total), vjust = -0.5) + scale_fill_brewer(palette="Set3") + theme(axis.title.x=element_blank(), axis.text.x=element_blank(), axis.ticks.x=element_blank(), axis.title.y = element_blank())
+    })
+  
+}
+
+# Create a Shiny app object
+shinyApp(ui = ui, server = server)
+```
+
+```{r}
+location <- "washington state ferries"
+class(location)
+```
+
+```{r}
+temp <- geocode_OSM(location, as.data.frame = TRUE)
+class(temp)
+coordinates(temp) <- ~lon+lat
+```
+
+```{r}
+temp
+
+temp %>% rename(name = query)
+coordinates(temp) <- ~lon+lat
+```
+
+
+
+```{r}
+temp
+```
+
+```{r}
+coordinates(temp)
+```
+
+```{r}
+chosen_location <- SpatialPointsDataFrame(coordinates(temp),
+                                          as.data.frame(temp$query),
+                                          proj4string = CRS('+init=EPSG:4326'))
+```
+
+```{r}
+coordinates(chosen_location)
+```
+
+
+```{r}
+chosen_location <- spTransform(chosen_location,CRS("+init=epsg:32148"))
+names(chosen_location@data)[1] <- "Name"
+chosen_location
+```
+
+```{r}
+coordinates(chosen_location)
+```
+
+```{r}
+try <- coordinates(temp)
+tryLon <- try[1]
+tryLat <- try[2]
+class(tryLon)
+```
+
+```{r}
+tryLon
+```
+
+
+```{r}
+tmap_mode("view")
+tm_shape(chosen_location) +
+  tm_dots() + tm_view(set.zoom.limits = c(15,18), set.view = c(lon = tryLon+1, lat = tryLat, zoom = 15))
+``` 
+
+```{r}
+class(chosen_location)
+```
+
+```{r}
+chosen_location_buffer <- buffer(chosen_location, width = 200)
+```
+
+```{r}
+class(chosen_location_buffer)
+```
+
+
+```{r}
+tm_shape(chosen_location_buffer) +
+  tm_polygons(alpha = 0.4) +
+  tm_shape(downtown_listings_sp) +
+  tm_dots()
+```
+9699490
+```{r}
+chosen_location_buffer_sf <- st_as_sf(chosen_location_buffer)
+downtown_listings_sp_sf <- st_as_sf(downtown_listings_sp)
+
+
+countofpoints <- st_contains(chosen_location_buffer_sf, downtown_listings_sp_sf)
+```
+
+```{r}
+nrow(as.data.frame(countofpoints))
+```
+
+```{r}
+countofpoints_df<- as.data.frame(countofpoints)
+countofpoints_df
+```
+
+```{r}
+countofpoints_df_w_listing <- downtown_listings_sp@data[countofpoints_df$col.id,]
+countofpoints_df_w_listing
+```
+
+```{r}
+countofpoints_df_w_listing$newprice <- as.numeric(gsub("\\$", "", countofpoints_df_w_listing$price))
+```
+
+```{r}
+temp3 <- countofpoints_df_w_listing %>% group_by(property_type) %>% summarise("total" = n())
+```
+
+```{r}
+temp3
+```
+
+```{r}
+ggplot(data = temp3, aes_string(x = "property_type", y = temp3$total, fill = "property_type")) + 
+        geom_col(width = 1, stat = "count") + geom_text(aes(label = temp3$total), vjust = -0.5) +
+    scale_fill_brewer(palette="Set3")
+```
+
+
+```{r}
+hist(countofpoints_df_w_listing$newprice)
+
+```
+
+```{r}
+ggplot(data = countofpoints_df_w_listing, aes(x = newprice, fill = room_type)) +
+  geom_histogram(binwidth = 10,color = "#1F3552", fill = "#4271AE") +
+        geom_vline(xintercept = mean(countofpoints_df_w_listing$newprice),size = 1, colour = "#FF3721",
+                   linetype = "dashed")
+```
+
+ggplot(data = listings_in_buffer_df, aes(x = newprice)) +
+        geom_histogram(binwidth = 20, color = 'black', fill = barfill) +
+        geom_vline(xintercept = mean(listings_in_buffer_df$newprice),size = 1, colour = "#FF3721",
+                   linetype = "dashed")
+
+```{r}
+coun
+```
+
+
+```{r}
+downtown_listings_sp@data
+```
+
+```{r}
+pairedcolor <- brewer.pal(12, "Set3")
+```
+
+
+```{r}
+tm_shape(downtown_listings_sp) +
+  tm_dots(col = 'property_type',
+          palette = pairedcolor)
+```
+
+```{r}
+ggplot(data = downtown_listings_sp@data, aes_string(x = "room_type", y = count, fill = "room_type")) + 
+        geom_col(width = 1, stat = "count") + geom_text(aes(label = temp3$total), vjust = -0.5)
+```
+
+```{r}
+tm_shape(zoning_generalized) +
+  tm_polygons()
+```
+
+```{r}
+proj4string(zoning_generalized)
+proj4string(downtown_listings_sp)
+```
+
+```{r}
+zoning_generalized_32148 <- spTransform(zoning_generalized, CRS("+init=epsg:32148"))
+```
+
+```{r}
+proj4string(zoning_generalized_32148)
+proj4string(downtown_listings_sp)
+```
+
+```{r}
+table(zoning_generalized$CLASS_DESC)
+```
+
+```{r}
+str(zoning_generalized)
+```
+
+
+```{r}
+temp <- over(downtown_listings_sp,zoning_generalized_32148)
+
+table(temp$ZONELUT_DE)
+```
+
+```{r}
+temp_over <- as.data.frame(table(temp$OBJECTID))
+temp_over$
+```
+
+```{r}
+zoning_generalized_32148@data <- inner_join(zoning_generalized_32148@data, temp_over,
+                                            by = c("OBJECTID" = "Var1"))
+```
+
+```{r}
+zoning_generalized_32148 <- subset(zoning_generalized_32148, CLASS_DESC == "Downtown")
+```
+
+```{r}
+nrow(zoning_generalized_32148@data)
+```
+
+
+```{r}
+tmap_mode("plot")
+
+tm_shape(zoning_generalized_32148) +
+  tm_fill(col = "Freq",
+          popup.vars =  c("Class Desc" = "CLASS_DESC", "Zone" = "ZONELUT_DE"),
+          palette = "Blues",
+          n = 8,
+          style = "jenks") +
+  tm_borders(alpha =0.5)
+```
+
+```{r}
+tm_shape(zoning_generalized_32148) +
+  tm_fill(col = "ZONELUT_DE") +
+  tm_borders(alpha = 0.5)
+```
+
+```{r}
+sum(zoning_generalized_32148$Freq)
+```
+
+```{r}
+temp_zone <- table(zoning_generalized_32148$ZONELUT_DE)
+temp_zone[temp_zone > 0 ]
+```
+
+
+```{r}
+temptable <- table(temp$ZONELUT_DE)
+temptable[temptable > 0]
+```
+
+
+
+```{r}
+table(zoning_generalized$ZONELUT)
+```
+
+```{r}
+temp <- over(downtown_listings_sp,seattle_downtown_sp)
+tempLOL <- table(temp$S_HOOD)
+tempLOL[tempLOL >0]
+```
+
+
+
+
+
+
+output$working_map <- renderLeaflet({
+    working_map <- readOGR(dsn=".",layer="japan_ver81", GDAL1_integer64_policy=TRUE)
+    working_map <- tm_shape(working_map) + tm_fill(col="NumIB", title="# Inbound to Cities", style="jenks")
+    tmap_leaflet(working_map)

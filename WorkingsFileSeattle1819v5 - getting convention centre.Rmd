@@ -1,0 +1,325 @@
+---
+title: "SeattleWorkingFile1819v2"
+author: "CHENG Xin Yuan"
+date: "16 March 2019"
+output: word_document
+---
+
+```{r}
+# packages <- c('maptools','spatstat','mapsapi','tmap','tmaptools','osrm','devtools','rgdal','osmdata','sf','sp','spdep','tidyverse')
+
+packages <- c('osrm','tmaptools','osmdata','rgdal','maptools','raster','spatstat','sf','sp','tmap','tidyverse')
+
+for (p in packages) {
+  if(!require(p, character.only = T)) {
+    install.packages(p)
+  }
+  library(p, character.only = T)
+}
+```
+
+***
+# Deriving the distances between the Attractions (10 in Downtown, 1 Space Needle) and every Downtown Airbnb listing
+## Workings to derive the Airbnb Listings for DownTown Seattle
+```{r}
+#now we want to add the class description
+zones = st_read(dsn = "data/spatial", layer = "Zoning_Generalized")
+st_crs(zones) #uses CRS espg 4326 (WGS84)
+
+#transform to EPSG:32148 NAD83
+zones_32148 <- st_transform(zones, 32148)
+st_crs(zones_32148)
+
+#creating projection object and checking that it is correct
+crs_object <- st_crs(zones_32148) 
+class(crs_object)
+list(crs_object)
+```
+
+```{r}
+#transforming listings as sf data
+#ALWAYS LONG THEN LAT
+listings = read_csv("data/aspatial/listings.csv")
+listings_sf <- st_as_sf(listings, 
+                       coords = c("longitude", "latitude"), crs = 4326)
+listings_32148 <- st_transform(listings_sf, crs_object)
+st_crs(listings_32148)
+st_bbox(listings_32148)
+```
+
+```{r}
+#downtown listings with the class description
+test_class_listings = st_join(listings_32148, zones_32148["CLASS_DESC"])
+downtown_listings <- subset(test_class_listings, test_class_listings$CLASS_DESC == "Downtown")
+``` 
+
+```{r}
+nrow(downtown_listings)
+```
+
+```{r}
+class(downtown_listings)
+```
+
+```{r}
+tmap_mode("view")
+tm_shape(downtown_listings) +
+  tm_dots()
+```
+
+
+## Get the attraction
+
+```{r}
+cpn <- readOGR(dsn = 'data/spatial',
+               layer = 'Common_Place_Names_CPN')
+```
+
+```{r}
+cpn@data
+```
+
+```{r}
+filter(cpn@data, CPN_PLACEN == "THE SEATTLE AQUARIUM")
+```
+
+### Check if the locations given by Chloe are in the CPN data
+```{r}
+attraction_loc <- c("PIKE PLACE MARKET","BENAROYA CONCERT HALL","COLUMBIA CENTER","SEATTLE ART MUSEUM","OLYMPIC SCULPTURE PARK","SEATTLE PUBLIC LIBRARY (DOWNTOWN)","SEATTLE GREAT WHEEL","WASHINGTON STATE FERRIES","THE SEATTLE AQUARIUM","KLONDIKE GOLDRUSH")
+filter(cpn@data, CPN_PLACEN %in% attraction_loc)
+```
+*Verdict: yes, it is inside*
+
+
+```{r}
+attractions <- subset(cpn,CPN_PLACEN %in% attraction_loc)
+```
+
+```{r}
+tm_shape(attractions) +
+  tm_dots()
+```
+
+```{r}
+attraction_names <- attractions$CPN_PLACEN
+```
+
+```{r}
+class(attraction_names)
+```
+
+
+```{r}
+attraction_names <- attraction_names[attraction_names %in% c("OLYMPIC SCULPTURE PARK","KLONDIKE GOLDRUSH","WASHINGTON STATE FERRIES")]
+```
+
+```{r}
+attraction_names
+```
+
+
+```{r}
+attraction_names <- as.character(attraction_names)
+```
+
+```{r}
+class(attraction_names)
+```
+
+#Replacement of location names Benaroya Concert Hall to BENAROYA HALL and Seattle Public Library to CENTRAL LIBRARY
+```{r}
+attraction_names <- ifelse(attraction_names == "OLYMPIC SCULPTURE PARK","Washington State Convention Center",ifelse(attraction_names == "KLONDIKE GOLDRUSH","KLONDIKE GOLD RUSH NATIONAL HISTORICAL PARK SEATTLE","SPACE NEEDLE"))
+```
+
+```{r}
+attraction_names
+```
+
+```{r}
+class(attraction_names)
+```
+
+
+```{r}
+attraction_names_geocode <- geocode_OSM(attraction_names)
+coordinates(attraction_names_geocode) <- ~lon+lat
+```
+
+```{r}
+attraction_names_geocode
+```
+
+```{r}
+tm_shape(attraction_names_geocode) + 
+  tm_dots()
+```
+
+
+```{r}
+filter_for_correct <- c("PIKE PLACE MARKET","BENAROYA CONCERT HALL","COLUMBIA CENTER","SEATTLE ART MUSEUM","SEATTLE PUBLIC LIBRARY (DOWNTOWN)","SEATTLE GREAT WHEEL","WASHINGTON STATE FERRIES","THE SEATTLE AQUARIUM")
+```
+
+
+```{r}
+attractions <- subset(attractions, CPN_PLACEN %in% filter_for_correct)
+
+coordinatesA <- coordinates(attractions)
+
+namesA <- attractions$CPN_PLACEN
+
+coordinatesA
+namesA
+```
+
+```{r}
+coordinatesB <- coordinates(attraction_names_geocode)
+
+namesB <- attraction_names_geocode$query
+
+coordinatesB
+namesB
+```
+
+```{r}
+class(namesA)
+class(namesB)
+```
+
+```{r}
+namesA <- as.character(namesA)
+```
+
+
+```{r}
+namesA <- as.data.frame(namesA)
+names(namesA) <- "Name"
+namesB <- as.data.frame(namesB)
+names(namesB) <- "Name"
+
+```
+
+
+```{r}
+namesA
+```
+
+```{r}
+namesB
+```
+
+
+
+```{r}
+NewAttractions <-  rbind(namesA,namesB)
+```
+
+```{r}
+NewAttractions
+```
+
+```{r}
+NewCoordinates <- rbind(coordinatesA, coordinatesB)
+NewCoordinates <- as.data.frame(NewCoordinates)
+NewCoordinates
+```
+
+```{r}
+class(NewAttractions)
+```
+
+```{r}
+class(NewCoordinates)
+```
+
+
+```{r}
+attractions2 <- SpatialPointsDataFrame(coords = NewCoordinates,
+                                       data = NewAttractions,
+                                       proj4string = CRS("+init=epsg:4326"))
+```
+
+```{r}
+attractions2@data
+```
+
+
+```{r}
+attractions2[10,]
+```
+
+```{r}
+class(downtown_listings)
+```
+
+```{r}
+downtown_listings <- as(downtown_listings, "Spatial")
+```
+
+```{r}
+class(downtown_listings)
+```
+
+
+```{r}
+attraction_loc12 <- 1:1148
+i=1
+```
+
+
+```{r}
+
+i = i
+
+for (airbnb_locs in i:1148) {
+     attraction_loc12[i] <- as.vector(osrmRoute(src = downtown_listings[airbnb_locs,], dst = attractions2[10,], sp = TRUE, overview = FALSE))[2]
+    
+     i = i + 1
+     
+  }
+
+i  
+
+```
+
+```{r}
+attraction_loc12
+```
+
+```{r}
+distance_matrix <- read_csv('distance_matrix_bygrouping(km).csv')
+```
+
+```{r}
+distance_matrix
+```
+
+```{r}
+WashingtonStateConventionCentre <- attraction_loc12
+```
+
+```{r}
+WashingtonStateConventionCentre
+```
+
+
+```{r}
+distance_matrix <- cbind(distance_matrix,WashingtonStateConventionCentre)
+```
+
+```{r}
+distance_matrix
+```
+
+```{r}
+distance_matrix$WashingtonStateConventionCentre <- distance_matrix$WashingtonStateConventionCentre*1000
+distance_matrix
+```
+
+```{r}
+write.csv(distance_matrix,'distance_matrix_bygrouping_wConvention(km).csv',row.names = FALSE)
+```
+
+```{r}
+tm_shape(attractions2) +tm_dots()
+```
+
